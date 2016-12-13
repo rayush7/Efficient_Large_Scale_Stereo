@@ -1,0 +1,314 @@
+// ROS Wrapper for ELAS
+
+#include <ros/ros.h>
+
+#include <sensor_msgs/Image.h>
+#include <sensor_msgs/CameraInfo.h>
+#include <sensor_msgs/image_encodings.h>
+
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
+#include <image_transport/subscriber_filter.h>
+
+#include <image_geometry/stereo_camera_model.h>
+
+#include <cv_bridge/cv_bridge.h>
+
+#include <pcl_ros/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+#include <elas.h>
+
+class Elas_Proc
+{
+public:
+  Elas_Proc(const std::string& transport)
+  {
+    ros::NodeHandle local_nh("~");
+    local_nh.param("queue_size", queue_size_, 5);
+
+    // Topics
+    std::string stereo_ns = nh.resolveName("stereo");
+    std::string left_topic = ros::names::clean(stereo_ns + "/left/" + nh.resolveName("image"));
+    std::string right_topic = ros::names::clean(stereo_ns + "/right/" + nh.resolveName("image"));
+    std::string left_info_topic = stereo_ns + "/left/camera_info";
+    std::string right_info_topic = stereo_ns + "/right/camera_info";
+
+    image_transport::ImageTransport it(nh);
+    left_sub_.subscribe(it, left_topic, 1, image_transport::TransportHints(transport, ros::TransportHints().unreliable()));
+    right_sub_.subscribe(it, right_topic, 1, image_transport::TransportHints(transport, ros::TransportHints().unreliable()));
+    left_info_sub_.subscribe(nh, left_info_topic, 1);
+    right_info_sub_.subscribe(nh, right_info_topic, 1);
+
+    image_transport::ImageTransport local_it(local_nh);
+    disp_pub_.reset(new Publisher(local_it.advertise("disparity", 1)));
+    pc_pub_.reset(new ros::Publisher(local_nh.advertise<PointCloud>("point_cloud", 1)));
+
+    // Synchronize input topics. Optionally do approximate synchronization.
+    bool approx;
+    local_nh.param("approximate_sync", approx, false);
+    if (approx)
+    {
+      approximate_sync_.reset(new ApproximateSync(ApproximatePolicy(queue_size_),
+                                                  left_sub_, right_sub_, left_info_sub_, right_info_sub_) );
+      approximate_sync_->registerCallback(boost::bind(&Elas_Proc::process, this, _1, _2, _3, _4));
+    }
+    else
+    {
+      exact_sync_.reset(new ExactSync(ExactPolicy(queue_size_),
+                                      left_sub_, right_sub_, left_info_sub_, right_info_sub_) );
+      exact_sync_->registerCallback(boost::bind(&Elas_Proc::process, this, _1, _2, _3, _4));
+    }
+
+    // Create the elas processing class
+    Elas::parameters param(Elas::ROBOTICS);
+
+    // Load parameters
+#define ELAS_PARAM(gettype,type,name) do { gettype __temp = (gettype)param.name; local_nh.getParam(#name, __temp); param.name = (type)__temp; } while (0)
+    ELAS_PARAM(int,int32_t,disp_min);
+    ELAS_PARAM(int,int32_t,disp_max);
+    ELAS_PARAM(double,float,support_threshold);
+    ELAS_PARAM(int,int32_t,support_texture);
+    ELAS_PARAM(int,int32_t,candidate_stepsize);
+    ELAS_PARAM(int,int32_t,incon_window_size);
+    ELAS_PARAM(int,int32_t,incon_threshold);
+    ELAS_PARAM(int,int32_t,incon_min_support);
+    ELAS_PARAM(bool,bool,add_corners);
+    ELAS_PARAM(int,int32_t,grid_size);
+    ELAS_PARAM(double,float,beta);
+    ELAS_PARAM(double,float,gamma);
+    ELAS_PARAM(double,float,sigma);
+    ELAS_PARAM(double,float,sradius);
+    ELAS_PARAM(int,int32_t,match_texture);
+    ELAS_PARAM(int,int32_t,lr_threshold);
+    ELAS_PARAM(double,float,speckle_sim_threshold);
+    ELAS_PARAM(int,int32_t,speckle_size);
+    ELAS_PARAM(int,int32_t,ipol_gap_width);
+    ELAS_PARAM(bool,bool,filter_median);
+    ELAS_PARAM(bool,bool,filter_adaptive_mean);
+    ELAS_PARAM(bool,bool,postprocess_only_left);
+
+    local_nh.param("downsample", down_sample_, true);
+    param.subsampling = down_sample_;
+    
+    elas_.reset(new Elas(param));
+  }
+
+  typedef image_transport::SubscriberFilter Subscriber;
+  typedef message_filters::Subscriber<sensor_msgs::CameraInfo> InfoSubscriber;
+  typedef image_transport::Publisher Publisher;
+  typedef message_filters::sync_policies::ExactTime<sensor_msgs::Image, sensor_msgs::Image, sensor_msgs::CameraInfo, sensor_msgs::CameraInfo> ExactPolicy;
+  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, sensor_msgs::Image, sensor_msgs::CameraInfo, sensor_msgs::CameraInfo> ApproximatePolicy;
+  typedef message_filters::Synchronizer<ExactPolicy> ExactSync;
+  typedef message_filters::Synchronizer<ApproximatePolicy> ApproximateSync;
+  typedef pcl::PointCloud<pcl::PointXYZRGB> PointCloud;
+
+  void publish_point_cloud(const sensor_msgs::ImageConstPtr& l_image_msg, float* l_disp_data, const std::vector<int32_t>& inliers, 
+                           int32_t l_width, int32_t l_height,
+                           const sensor_msgs::CameraInfoConstPtr& l_info_msg, const sensor_msgs::CameraInfoConstPtr& r_info_msg)
+  {
+    try
+    {
+      cv_bridge::CvImageConstPtr cv_ptr;
+      cv_ptr = cv_bridge::toCvShare(l_image_msg, sensor_msgs::image_encodings::RGB8);
+      image_geometry::StereoCameraModel model;
+      model.fromCameraInfo(*l_info_msg, *r_info_msg);
+      PointCloud::Ptr point_cloud(new PointCloud());
+      point_cloud->header = pcl_conversions::toPCL(l_info_msg->header);
+      point_cloud->width = l_image_msg->width;
+      point_cloud->height = l_image_msg->height;
+
+      double bad_point_val = std::numeric_limits<double>::quiet_NaN ();
+      pcl::PointXYZRGB bad_point; bad_point.x = bad_point.y = bad_point.z = bad_point_val;
+      point_cloud->points.resize(l_image_msg->width*l_image_msg->height, bad_point);
+
+      for (size_t i=0; i<inliers.size(); i++)
+      {
+        cv::Point2d left_uv;
+        int32_t index = inliers[i];
+        if (down_sample_)
+        {
+          left_uv.x = (index % l_width) * 2;
+          left_uv.y = (index / l_width) * 2;
+        }
+        else
+        {
+          left_uv.x = index % l_width;
+          left_uv.y = index / l_width;
+        }
+        int32_t pc_index = left_uv.y * l_image_msg->width + left_uv.x;
+        cv::Point3d point;
+        model.projectDisparityTo3d(left_uv, l_disp_data[index], point);
+        point_cloud->points[pc_index].x = point.x;
+        point_cloud->points[pc_index].y = point.y;
+        point_cloud->points[pc_index].z = point.z;
+        cv::Vec3b col = cv_ptr->image.at<cv::Vec3b>(left_uv.y,left_uv.x);
+        point_cloud->points[pc_index].r = col[0];
+        point_cloud->points[pc_index].g = col[1];
+        point_cloud->points[pc_index].b = col[2];
+      }
+
+      // Unfortunately I have to do this so exact sync works later in the pipeline
+      sensor_msgs::PointCloud2 out_cloud; pcl::toROSMsg(*point_cloud, out_cloud);
+      out_cloud.header.stamp = l_info_msg->header.stamp;
+      pc_pub_->publish(out_cloud);
+    }
+    catch (cv_bridge::Exception& e)
+    {
+      ROS_ERROR("cv_bridge exception: %s", e.what());
+    }
+  }
+
+  void process(const sensor_msgs::ImageConstPtr& l_image_msg, const sensor_msgs::ImageConstPtr& r_image_msg,
+               const sensor_msgs::CameraInfoConstPtr& l_info_msg, const sensor_msgs::CameraInfoConstPtr& r_info_msg)
+  {
+    // Have a synchronised pair of images, now to process using elas
+    // convert images if necessary
+    uint8_t *l_image_data, *r_image_data;
+    int32_t l_step, r_step;
+    cv_bridge::CvImageConstPtr l_cv_ptr, r_cv_ptr; cv::Mat l_mat, r_mat;
+    if (l_image_msg->encoding == sensor_msgs::image_encodings::MONO8)
+    {
+      l_image_data = const_cast<uint8_t*>(&(l_image_msg->data[0]));
+      l_step = l_image_msg->step;
+    }
+    else
+    {
+      l_cv_ptr = cv_bridge::toCvShare(l_image_msg, sensor_msgs::image_encodings::MONO8);
+      if (l_cv_ptr->image.elemSize() != 1)
+      {
+        l_cv_ptr->image.convertTo(l_mat, CV_8U, 1./(double)pow(256, (l_cv_ptr->image.elemSize()-1)));
+        l_image_data = l_mat.data;
+        l_step = l_mat.step[0];
+      }
+      else
+      {
+        l_image_data = l_cv_ptr->image.data;
+        l_step = l_cv_ptr->image.step[0];
+      }
+    }
+    if (r_image_msg->encoding == sensor_msgs::image_encodings::MONO8)
+    {
+      r_image_data = const_cast<uint8_t*>(&(r_image_msg->data[0]));
+      r_step = r_image_msg->step;
+    }
+    else
+    {
+      r_cv_ptr = cv_bridge::toCvShare(r_image_msg, sensor_msgs::image_encodings::MONO8);
+      if (r_cv_ptr->image.elemSize() != 1)
+      {
+        r_cv_ptr->image.convertTo(r_mat, CV_8U, 1./(double)pow(256, (r_cv_ptr->image.elemSize()-1)));
+        r_image_data = r_mat.data;
+        r_step = r_mat.step[0];
+      }
+      else
+      {
+        r_image_data = r_cv_ptr->image.data;
+        r_step = r_cv_ptr->image.step[0];
+      }
+    }
+
+    ROS_ASSERT(l_step == r_step);
+    ROS_ASSERT(l_image_msg->width == r_image_msg->width);
+    ROS_ASSERT(l_image_msg->height == r_image_msg->height);
+
+    int32_t width = l_image_msg->width;
+    int32_t height = l_image_msg->height;
+    if (down_sample_)
+    {
+      width /= 2;
+      height /= 2;
+    }
+
+    // Allocate
+    const int32_t dims[3] = {l_image_msg->width,l_image_msg->height,l_step};
+    float* l_disp_data = new float[width*height*sizeof(float)];
+    float* r_disp_data = new float[width*height*sizeof(float)];
+
+    // Process
+    if (!elas_->process(l_image_data, r_image_data, l_disp_data, r_disp_data, dims))
+    {
+      ROS_WARN_THROTTLE(10, "libelas failed to find enough support matches for a solution to be found.");
+      // There are no important depths, since libelas failed.
+      cv_bridge::CvImage out_msg;
+      out_msg.header = l_image_msg->header;
+      out_msg.encoding = sensor_msgs::image_encodings::MONO8;
+      out_msg.image = cv::Mat(height, width, CV_8UC1, cv::Scalar(0));
+
+      // Publish
+      disp_pub_->publish(out_msg.toImageMsg());
+      publish_point_cloud(l_image_msg, NULL, std::vector<int32_t>(), width, height, l_info_msg, r_info_msg);
+
+      // Cleanup data
+      delete l_disp_data;
+      delete r_disp_data;
+
+      return;
+    }
+
+    // Find the max for scaling the image colour
+    float disp_max = 0;
+    for (int32_t i=0; i<width*height; i++)
+    {
+      if (l_disp_data[i]>disp_max) disp_max = l_disp_data[i];
+      if (r_disp_data[i]>disp_max) disp_max = r_disp_data[i];
+    }
+
+    cv_bridge::CvImage out_msg;
+    out_msg.header = l_image_msg->header;
+    out_msg.encoding = sensor_msgs::image_encodings::MONO8;
+    out_msg.image = cv::Mat(height, width, CV_8UC1);
+    //out_msg.image = cv::Mat(l_image_msg->height, l_image_msg->width, CV_8U, l_image_data, l_step);
+    std::vector<int32_t> inliers;
+    for (int32_t i=0; i<width*height; i++)
+    {
+      out_msg.image.data[i] = (uint8_t)std::max(255.0*l_disp_data[i]/disp_max,0.0);
+      if (l_disp_data[i] > 0) inliers.push_back(i);
+    }
+
+    // Publish
+    disp_pub_->publish(out_msg.toImageMsg());
+    publish_point_cloud(l_image_msg, l_disp_data, inliers, width, height, l_info_msg, r_info_msg);
+
+    // Cleanup data
+    delete l_disp_data;
+    delete r_disp_data;
+  }
+
+private:
+
+  ros::NodeHandle nh;
+  Subscriber left_sub_, right_sub_;
+  InfoSubscriber left_info_sub_, right_info_sub_;
+  boost::shared_ptr<Publisher> disp_pub_;
+  boost::shared_ptr<ros::Publisher> pc_pub_;
+  boost::shared_ptr<ExactSync> exact_sync_;
+  boost::shared_ptr<ApproximateSync> approximate_sync_;
+  boost::shared_ptr<Elas> elas_;
+  int queue_size_;
+  bool down_sample_;
+};
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "elas_ros");
+  if (ros::names::remap("stereo") == "stereo") {
+    ROS_WARN("'stereo' has not been remapped! Example command-line usage:\n"
+             "\t$ rosrun elas_ros elas_ros stereo:=narrow_stereo image:=image_rect");
+  }
+  if (ros::names::remap("image").find("rect") == std::string::npos) {
+    ROS_WARN("elas_ros needs rectified input images. The used image "
+             "topic is '%s'. Are you sure the images are rectified?",
+             ros::names::remap("image").c_str());
+  }
+
+  std::string transport = argc > 1 ? argv[1] : "raw";
+  Elas_Proc processor(transport);
+
+  ros::spin();
+  return 0;
+}
